@@ -17,7 +17,9 @@ if (fs.existsSync(envFile)) {
 }
 
 const PORT = Number(process.env.PORT || 4173);
-const db = new DatabaseSync(process.env.STUDY_OS_DB || path.join(__dirname, 'study-os.db'));
+const isVercel = Boolean(process.env.VERCEL);
+const dbPath = process.env.STUDY_OS_DB || (isVercel ? path.join('/tmp', 'study-os.db') : path.join(__dirname, 'study-os.db'));
+const db = new DatabaseSync(dbPath);
 
 // Schema initialization & migrations
 db.exec(`
@@ -1334,4 +1336,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Class 11 Study OS running at http://localhost:${PORT}`));
+if (!process.env.VERCEL) {
+  server.listen(PORT, () => console.log(`Class 11 Study OS running at http://localhost:${PORT}`));
+}
+
+module.exports = server;

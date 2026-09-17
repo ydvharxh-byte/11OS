@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Class 11 CBSE Personal Study Command OS",
   "main": "server.js",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "node server.js"
   },
