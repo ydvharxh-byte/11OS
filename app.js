@@ -2389,12 +2389,24 @@ document.addEventListener('change', async e => {
     if (!boot.configured) {
       document.body.innerHTML = `
         <div class="setup-layer">
-          <div class="setup-card">
-            <h1>Setup Required</h1>
-            <p>Please initialize the setup wizard or run the initial database seed.</p>
+          <div class="setup-card" style="background:#fff;padding:36px;border-radius:20px;max-width:480px;text-align:center;box-shadow:0 16px 50px rgba(0,0,0,0.18)">
+            <h1 style="margin-top:0;font-size:24px">Class 11 Study OS</h1>
+            <p style="color:#666;font-size:13px;line-height:1.6;margin-bottom:24px">Welcome to your personal Class 11 study engine. Initialize your syllabus, subjects, and study tracker to begin.</p>
+            <button id="btn-init-setup" class="primary" style="padding:13px 28px;font-size:14px;cursor:pointer">Initialize Class 11 Workstation →</button>
           </div>
         </div>
       `;
+      $('#btn-init-setup')?.addEventListener('click', async () => {
+        try {
+          $('#btn-init-setup').disabled = true;
+          $('#btn-init-setup').textContent = 'Initializing CBSE Syllabus...';
+          await api('/api/setup', { method: 'POST', body: JSON.stringify({ name: 'Student' }) });
+          window.location.reload();
+        } catch (err) {
+          alert('Setup error: ' + err.message);
+          window.location.reload();
+        }
+      });
       return;
     }
     shell();

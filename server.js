@@ -156,7 +156,13 @@ const body = req => new Promise((resolve, reject) => {
   });
 });
 
-function userId() { return one('SELECT id FROM users ORDER BY id LIMIT 1')?.id; }
+function userId() { 
+  let uid = one('SELECT id FROM users ORDER BY id LIMIT 1')?.id; 
+  if (!uid) {
+    try { uid = seedUser({}); } catch (e) { console.error('Auto-seed error:', e); }
+  }
+  return uid;
+}
 
 function subjectRows(uid) {
   return all(`
