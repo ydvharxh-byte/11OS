@@ -1336,7 +1336,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-if (!process.env.VERCEL) {
+if (require.main === module && !process.env.VERCEL) {
   server.listen(PORT, () => console.log(`Class 11 Study OS running at http://localhost:${PORT}`));
 }
 
