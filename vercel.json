@@ -1,7 +1,12 @@
 {
+  "version": 2,
   "rewrites": [
     {
-      "source": "/api/:path*",
+      "source": "/api/(.*)",
+      "destination": "/api?__path=$1"
+    },
+    {
+      "source": "/api",
       "destination": "/api"
     },
     {

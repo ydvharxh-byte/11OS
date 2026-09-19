@@ -19,6 +19,19 @@ if (fs.existsSync(envFile)) {
 const PORT = Number(process.env.PORT || 4173);
 const isVercel = Boolean(process.env.VERCEL);
 const dbPath = process.env.STUDY_OS_DB || (isVercel ? path.join('/tmp', 'study-os.db') : path.join(__dirname, 'study-os.db'));
+
+// On Vercel, copy pre-existing database file from bundle to /tmp if not yet present
+if (isVercel && !fs.existsSync(dbPath)) {
+  const localDb = path.join(__dirname, 'study-os.db');
+  if (fs.existsSync(localDb)) {
+    try {
+      fs.copyFileSync(localDb, dbPath);
+    } catch (e) {
+      console.warn('Could not copy bundled DB to /tmp:', e.message);
+    }
+  }
+}
+
 const db = new DatabaseSync(dbPath);
 
 // Schema initialization & migrations
@@ -623,27 +636,200 @@ Return ONLY a valid JSON object matching this schema:
 
 // Serve Static Files with SPA Fallback
 function serveFile(res, url) {
-  let file = url === '/' ? path.join(__dirname, 'index.html') : path.join(__dirname, decodeURIComponent(url));
-  if (!file.startsWith(__dirname) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-    const ext = path.extname(url);
+  const cleanUrl = decodeURIComponent(url.split('?')[0]);
+  let target = cleanUrl === '/' ? 'index.html' : cleanUrl.replace(/^\//, '');
+  
+  // Try public/ first, then fallback to root
+  let file = path.join(__dirname, 'public', target);
+  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    file = path.join(__dirname, target);
+  }
+
+  // SPA fallback for non-file routes
+  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    const ext = path.extname(cleanUrl);
     if (!ext || ext === '.html') {
-      file = path.join(__dirname, 'index.html');
+      file = fs.existsSync(path.join(__dirname, 'public', 'index.html'))
+        ? path.join(__dirname, 'public', 'index.html')
+        : path.join(__dirname, 'index.html');
     } else {
-      res.writeHead(404);
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
       return res.end('Not found');
     }
   }
-  const ext = path.extname(file);
-  const types = { '.js': 'text/javascript', '.css': 'text/css', '.html': 'text/html', '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg' };
-  res.writeHead(200, { 'Content-Type': types[ext] || 'text/plain' });
+
+  const ext = path.extname(file).toLowerCase();
+  const types = {
+    '.js': 'text/javascript',
+    '.css': 'text/css',
+    '.html': 'text/html',
+    '.json': 'application/json',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon',
+    '.webp': 'image/webp'
+  };
+  res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
   fs.createReadStream(file).pipe(res);
 }
 
-// HTTP Server & API Endpoints
-const server = http.createServer(async (req, res) => {
+// State Backup & Persistence across Serverless/Restart cycles
+function exportUserData(uid) {
+  return {
+    version: 1,
+    exported_at: new Date().toISOString(),
+    user: one('SELECT * FROM users WHERE id = ?', uid),
+    schedules: all('SELECT * FROM schedules WHERE user_id = ?', uid),
+    mastery_settings: all('SELECT * FROM mastery_settings WHERE user_id = ?', uid),
+    topics: all(`SELECT t.id, t.status FROM topics t JOIN chapters c ON c.id = t.chapter_id JOIN subjects s ON s.id = c.subject_id WHERE s.user_id = ?`, uid),
+    mastery: all(`SELECT m.* FROM mastery m JOIN topics t ON t.id = m.topic_id JOIN chapters c ON c.id = t.chapter_id JOIN subjects s ON s.id = c.subject_id WHERE s.user_id = ?`, uid),
+    tasks: all('SELECT * FROM tasks WHERE user_id = ?', uid),
+    school_work: all('SELECT * FROM school_work WHERE user_id = ?', uid),
+    backlog_items: all('SELECT * FROM backlog_items WHERE user_id = ?', uid),
+    exams: all('SELECT * FROM exams WHERE user_id = ?', uid),
+    teacher_important_topics: all('SELECT * FROM teacher_important_topics WHERE user_id = ?', uid),
+    holidays: all('SELECT * FROM holidays WHERE user_id = ?', uid)
+  };
+}
+
+function restoreUserData(data) {
+  if (!data || typeof data !== 'object') throw new Error('Invalid backup data format');
+  
+  db.exec('BEGIN TRANSACTION;');
   try {
-    const u = new URL(req.url, `http://${req.headers.host}`);
-    const p = u.pathname;
+    let uid = userId();
+    if (data.user?.name) {
+      run('UPDATE users SET name = ?, syllabus = ? WHERE id = ?', data.user.name, data.user.syllabus || 'CBSE Class 11', uid);
+    }
+
+    if (Array.isArray(data.schedules) && data.schedules.length) {
+      const sc = data.schedules[0];
+      run(`
+        INSERT INTO schedules (user_id, school_start, school_end, tuition_start, tuition_end, available_minutes, preferred_session, sleep_start, sleep_end, current_day_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          school_start = excluded.school_start, school_end = excluded.school_end,
+          tuition_start = excluded.tuition_start, tuition_end = excluded.tuition_end,
+          available_minutes = excluded.available_minutes, preferred_session = excluded.preferred_session,
+          sleep_start = excluded.sleep_start, sleep_end = excluded.sleep_end,
+          current_day_type = excluded.current_day_type
+      `, uid, sc.school_start, sc.school_end, sc.tuition_start, sc.tuition_end, sc.available_minutes, sc.preferred_session, sc.sleep_start, sc.sleep_end, sc.current_day_type);
+    }
+
+    if (Array.isArray(data.mastery_settings) && data.mastery_settings.length) {
+      const ms = data.mastery_settings[0];
+      run(`
+        INSERT INTO mastery_settings (user_id, mastered_threshold, revision_threshold)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET mastered_threshold = excluded.mastered_threshold, revision_threshold = excluded.revision_threshold
+      `, uid, ms.mastered_threshold || 90, ms.revision_threshold || 70);
+    }
+
+    if (Array.isArray(data.topics) && data.topics.length) {
+      for (const t of data.topics) {
+        if (t.id && t.status) {
+          run('UPDATE topics SET status = ? WHERE id = ?', t.status, t.id);
+        }
+      }
+    }
+
+    if (Array.isArray(data.mastery) && data.mastery.length) {
+      for (const m of data.mastery) {
+        if (m.topic_id) {
+          run(`
+            INSERT INTO mastery (topic_id, score, next_revision_date, updated_at)
+            VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+            ON CONFLICT(topic_id) DO UPDATE SET score = excluded.score, next_revision_date = excluded.next_revision_date, updated_at = excluded.updated_at
+          `, m.topic_id, m.score || 0, m.next_revision_date || null, m.updated_at || null);
+        }
+      }
+    }
+
+    if (Array.isArray(data.tasks)) {
+      run('DELETE FROM tasks WHERE user_id = ?', uid);
+      for (const t of data.tasks) {
+        run(`
+          INSERT INTO tasks (user_id, subject_id, chapter_id, topic_id, title, scheduled_for, estimated_minutes, status, source, category, due_date, priority, remarks, attachment, task_type, priority_reasons, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, uid, t.subject_id || null, t.chapter_id || null, t.topic_id || null, t.title, t.scheduled_for || new Date().toISOString().slice(0, 10), t.estimated_minutes || 30, t.status || 'OPEN', t.source || 'PLANNER', t.category || 'SELF_STUDY', t.due_date || null, t.priority || 'MEDIUM', t.remarks || null, t.attachment || null, t.task_type || 'STUDY', t.priority_reasons || null, t.created_at || new Date().toISOString());
+      }
+    }
+
+    if (Array.isArray(data.school_work)) {
+      run('DELETE FROM school_work WHERE user_id = ?', uid);
+      for (const sw of data.school_work) {
+        run(`
+          INSERT INTO school_work (user_id, subject_id, chapter_id, topic_id, work_type, description, estimated_minutes, remaining_minutes, due_date, priority, teacher, remarks, attachment, status, created_at, completed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, uid, sw.subject_id, sw.chapter_id || null, sw.topic_id || null, sw.work_type || 'NOTEBOOK', sw.description || '', sw.estimated_minutes || 30, sw.remaining_minutes || 0, sw.due_date || null, sw.priority || 'MEDIUM', sw.teacher || null, sw.remarks || null, sw.attachment || null, sw.status || 'NOT_STARTED', sw.created_at || new Date().toISOString(), sw.completed_at || null);
+      }
+    }
+
+    if (Array.isArray(data.backlog_items) && data.backlog_items.length) {
+      for (const b of data.backlog_items) {
+        if (b.title) {
+          run(`
+            UPDATE backlog_items SET status = ?, priority = ?, estimated_minutes = ?, last_studied_at = ?
+            WHERE user_id = ? AND title = ?
+          `, b.status || 'OPEN', b.priority || 'MEDIUM', b.estimated_minutes || 30, b.last_studied_at || null, uid, b.title);
+        }
+      }
+    }
+
+    if (Array.isArray(data.exams)) {
+      run('DELETE FROM exams WHERE user_id = ?', uid);
+      for (const e of data.exams) {
+        run(`
+          INSERT INTO exams (user_id, subject_id, name, exam_date, syllabus_notes, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `, uid, e.subject_id || null, e.name, e.exam_date, e.syllabus_notes || null, e.created_at || new Date().toISOString());
+      }
+    }
+
+    if (Array.isArray(data.teacher_important_topics)) {
+      run('DELETE FROM teacher_important_topics WHERE user_id = ?', uid);
+      for (const tt of data.teacher_important_topics) {
+        run(`
+          INSERT INTO teacher_important_topics (user_id, subject_id, chapter_id, topic_id, topic_name, expected_marks, importance, exam_name, teacher_name, remarks, date_added)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, uid, tt.subject_id, tt.chapter_id || null, tt.topic_id || null, tt.topic_name, tt.expected_marks || 5, tt.importance || 'HIGH', tt.exam_name || null, tt.teacher_name || null, tt.remarks || null, tt.date_added || new Date().toISOString());
+      }
+    }
+
+    if (Array.isArray(data.holidays)) {
+      for (const h of data.holidays) {
+        run(`
+          INSERT INTO holidays (user_id, holiday_date, label, day_type, extra_minutes)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(user_id, holiday_date) DO UPDATE SET label = excluded.label, day_type = excluded.day_type, extra_minutes = excluded.extra_minutes
+        `, uid, h.holiday_date, h.label || 'Holiday', h.day_type || 'HOLIDAY', h.extra_minutes || 150);
+      }
+    }
+
+    db.exec('COMMIT;');
+    return { ok: true, restoredAt: new Date().toISOString() };
+  } catch (err) {
+    try { db.exec('ROLLBACK;'); } catch (_) {}
+    throw err;
+  }
+}
+
+// HTTP Server & API Endpoints
+async function handleRequest(req, res) {
+  try {
+    const host = req.headers.host || 'localhost';
+    const u = new URL(req.url, `http://${host}`);
+    let p = u.pathname;
+
+    // Handle Vercel rewrite parameter or custom header
+    const rewritten = u.searchParams.get('__path') || req.headers['x-matched-path'];
+    if (rewritten && (p === '/api' || p === '/api/')) {
+      const cleanPath = rewritten.startsWith('/') ? rewritten : `/${rewritten}`;
+      p = cleanPath.startsWith('/api/') ? cleanPath : `/api${cleanPath}`;
+    }
+
     const uid = userId();
 
     if (!p.startsWith('/api/')) return serveFile(res, p);
@@ -651,6 +837,17 @@ const server = http.createServer(async (req, res) => {
     // Bootstrap
     if (p === '/api/bootstrap' && req.method === 'GET') {
       return json(res, 200, bootstrap());
+    }
+
+    // State Sync / Backup & Restore (Zero Data Loss across Serverless / Render restarts)
+    if (p === '/api/sync/backup' && req.method === 'GET') {
+      return json(res, 200, exportUserData(uid));
+    }
+
+    if (p === '/api/sync/restore' && req.method === 'POST') {
+      const payload = await body(req);
+      const result = restoreUserData(payload);
+      return json(res, 200, { ok: true, state: bootstrap(), result });
     }
 
     // Setup
@@ -874,10 +1071,30 @@ const server = http.createServer(async (req, res) => {
     // ==========================================
     // STAGE 4: SPOTIFY INTEGRATION
     // ==========================================
+    const getEffectiveSpotifyRedirectUri = (req, explicitRedirect = null) => {
+      if (explicitRedirect && typeof explicitRedirect === 'string' && explicitRedirect.startsWith('http')) {
+        return explicitRedirect;
+      }
+      if (process.env.SPOTIFY_REDIRECT_URI) {
+        return process.env.SPOTIFY_REDIRECT_URI;
+      }
+      const proto = req.headers['x-forwarded-proto'] || (req.connection && req.connection.encrypted ? 'https' : 'http');
+      const host = req.headers['x-forwarded-host'] || req.headers.host;
+      if (host) {
+        return `${proto}://${host}/api/integrations/spotify/callback`;
+      }
+      if (process.env.RENDER_EXTERNAL_URL) {
+        return `${process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '')}/api/integrations/spotify/callback`;
+      }
+      return 'http://localhost:4173/api/integrations/spotify/callback';
+    };
+
     if (p === '/api/integrations/spotify/auth-url' && req.method === 'GET') {
       try {
-        const url = spotifyManager.getAuthUrl();
-        return json(res, 200, { url, configured: true });
+        const explicitRedirect = u.searchParams.get('redirect_uri');
+        const redirectUri = getEffectiveSpotifyRedirectUri(req, explicitRedirect);
+        const url = spotifyManager.getAuthUrl('study_os_spotify', redirectUri);
+        return json(res, 200, { url, configured: true, redirectUri });
       } catch (err) {
         return json(res, 200, { configured: false, error: err.message });
       }
@@ -894,16 +1111,26 @@ const server = http.createServer(async (req, res) => {
       process.env.SPOTIFY_CLIENT_ID = clientId;
       process.env.SPOTIFY_CLIENT_SECRET = clientSecret;
 
+      const redirectUri = getEffectiveSpotifyRedirectUri(req, d.redirectUri);
+
       const envPath = path.join(__dirname, '.env');
-      if (fs.existsSync(envPath)) {
-        let content = fs.readFileSync(envPath, 'utf8');
-        content = content.replace(/^SPOTIFY_CLIENT_ID=.*$/m, `SPOTIFY_CLIENT_ID=${clientId}`);
-        content = content.replace(/^SPOTIFY_CLIENT_SECRET=.*$/m, `SPOTIFY_CLIENT_SECRET=${clientSecret}`);
-        fs.writeFileSync(envPath, content, 'utf8');
-      }
+      try {
+        let content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+        if (content.includes('SPOTIFY_CLIENT_ID=')) {
+          content = content.replace(/^SPOTIFY_CLIENT_ID=.*$/m, `SPOTIFY_CLIENT_ID=${clientId}`);
+        } else {
+          content += `\nSPOTIFY_CLIENT_ID=${clientId}`;
+        }
+        if (content.includes('SPOTIFY_CLIENT_SECRET=')) {
+          content = content.replace(/^SPOTIFY_CLIENT_SECRET=.*$/m, `SPOTIFY_CLIENT_SECRET=${clientSecret}`);
+        } else {
+          content += `\nSPOTIFY_CLIENT_SECRET=${clientSecret}`;
+        }
+        fs.writeFileSync(envPath, content.trim() + '\n', 'utf8');
+      } catch (_) {}
 
       try {
-        const url = spotifyManager.getAuthUrl();
+        const url = spotifyManager.getAuthUrl('study_os_spotify', redirectUri);
         return json(res, 200, { ok: true, url });
       } catch (e) {
         return json(res, 200, { ok: true, message: 'Saved successfully.' });
@@ -916,10 +1143,16 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400, { 'Content-Type': 'text/html' });
         return res.end('<h1>Spotify connection error: No code provided</h1>');
       }
-      await spotifyManager.exchangeCode(db, uid, code);
-      // Redirect back to main application
-      res.writeHead(302, { 'Location': '/#settings' });
-      return res.end();
+      try {
+        const redirectUri = getEffectiveSpotifyRedirectUri(req);
+        await spotifyManager.exchangeCode(db, uid, code, redirectUri);
+        // Redirect back to main application
+        res.writeHead(302, { 'Location': '/#settings' });
+        return res.end();
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'text/html' });
+        return res.end(`<h1>Spotify connection failed</h1><p>${err.message}</p><p><a href="/#settings">Back to Settings</a></p>`);
+      }
     }
 
     if (p === '/api/integrations/spotify/status' && req.method === 'GET') {
@@ -1340,10 +1573,15 @@ const server = http.createServer(async (req, res) => {
     console.error(err);
     json(res, 500, { error: err.message });
   }
-});
+}
+
+const server = http.createServer(handleRequest);
 
 if (require.main === module && !process.env.VERCEL) {
   server.listen(PORT, () => console.log(`Class 11 Study OS running at http://localhost:${PORT}`));
 }
 
 module.exports = server;
+module.exports.server = server;
+module.exports.handleRequest = handleRequest;
+

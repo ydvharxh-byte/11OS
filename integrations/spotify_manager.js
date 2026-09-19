@@ -2,7 +2,20 @@
 
 const CLIENT_ID = () => process.env.SPOTIFY_CLIENT_ID || '';
 const CLIENT_SECRET = () => process.env.SPOTIFY_CLIENT_SECRET || '';
-const REDIRECT_URI = () => process.env.SPOTIFY_REDIRECT_URI || 'http://localhost:4173/api/integrations/spotify/callback';
+function resolveRedirectUri(override) {
+  if (override && typeof override === 'string' && override.startsWith('http')) {
+    return override;
+  }
+  if (process.env.SPOTIFY_REDIRECT_URI) {
+    return process.env.SPOTIFY_REDIRECT_URI;
+  }
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return `${process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '')}/api/integrations/spotify/callback`;
+  }
+  return 'http://localhost:4173/api/integrations/spotify/callback';
+}
+
+const REDIRECT_URI = (override) => resolveRedirectUri(override);
 
 const SCOPES = [
   'user-read-playback-state',
@@ -15,15 +28,16 @@ const SCOPES = [
 ].join(' ');
 
 // Generate official OAuth authorization URL
-function getAuthUrl(state = 'study_os_spotify') {
+function getAuthUrl(state = 'study_os_spotify', redirectUri = null) {
   const cid = CLIENT_ID();
   if (!cid) {
     throw new Error('SPOTIFY_CLIENT_ID is not configured in .env');
   }
+  const effectiveRedirect = resolveRedirectUri(redirectUri);
   const params = new URLSearchParams({
     client_id: cid,
     response_type: 'code',
-    redirect_uri: REDIRECT_URI(),
+    redirect_uri: effectiveRedirect,
     scope: SCOPES,
     state
   });
@@ -31,7 +45,7 @@ function getAuthUrl(state = 'study_os_spotify') {
 }
 
 // Exchange authorization code for tokens and save to SQLite
-async function exchangeCode(db, uid, code) {
+async function exchangeCode(db, uid, code, redirectUri = null) {
   const cid = CLIENT_ID();
   const csecret = CLIENT_SECRET();
   if (!cid || !csecret) {
@@ -40,11 +54,12 @@ async function exchangeCode(db, uid, code) {
 
   const tokenUrl = 'https://accounts.spotify.com/api/token';
   const creds = Buffer.from(`${cid}:${csecret}`).toString('base64');
+  const effectiveRedirect = resolveRedirectUri(redirectUri);
 
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
-    redirect_uri: REDIRECT_URI()
+    redirect_uri: effectiveRedirect
   });
 
   const res = await fetch(tokenUrl, {
